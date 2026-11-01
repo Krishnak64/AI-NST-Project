@@ -1,17 +1,26 @@
+"""
+Flask NST app tuned for Render's free tier (512 MB RAM, CPU only).
 
-import os
-import uuid
+Start command (Render -> Settings -> Start Command):
+    gunicorn app:app --workers 1 --threads 1 --timeout 180 --bind 0.0.0.0:$PORT
+
+Rename this file to app.py before deploying.
+"""
+import gc
 import logging
+import os
+import time
+import uuid
 
 import torch
-from PIL import Image, UnidentifiedImageError
 from flask import Flask, render_template, request, send_from_directory
-from flask_wtf import FlaskForm
 from flask_bootstrap import Bootstrap
-from werkzeug.utils import secure_filename
-from wtforms import FileField, SubmitField, FloatField, HiddenField
-from wtforms.validators import InputRequired, NumberRange
+from flask_wtf import FlaskForm
+from PIL import Image
 from torchvision import transforms
+from werkzeug.utils import secure_filename
+from wtforms import FileField, FloatField, HiddenField, SubmitField
+from wtforms.validators import InputRequired, NumberRange
 
 from utils.models import VGGEncoder, Decoder
 from utils.utils import adaptive_instance_normalization
@@ -23,40 +32,49 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "static", "uploads")
+
+# Longest side of the images fed to the network. Keep small on the free tier:
+# memory use grows with the square of this value.
+MAX_SIDE = int(os.environ.get("MAX_SIDE", 256))
+
+# Delete uploaded/generated files older than this (seconds).
+FILE_MAX_AGE = 60 * 60
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'supersecretkey'
-app.config['UPLOAD_FOLDER'] = 'static/uploads'
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8 MB
-
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me-in-render-env")
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB
 app.config["ALLOWED_EXTENSIONS"] = {"png", "jpg", "jpeg"}
 
-os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 Bootstrap(app)
 
-# Render CPU deployment
+# CPU only, single thread: lowest memory and CPU contention.
 device = torch.device("cpu")
 torch.set_num_threads(1)
+torch.set_grad_enabled(False)
 
 logger.info("Loading AdaIN models on %s", device)
 
-encoder_path = os.path.join(BASE_DIR, "vgg_normalised.pth")
-decoder_path = os.path.join(
-    BASE_DIR, "experiment", "final_exp", "decoder_final.pth"
-)
-
-encoder = VGGEncoder(encoder_path).to(device)
+encoder = VGGEncoder(os.path.join(BASE_DIR, "vgg_normalised.pth")).to(device)
 decoder = Decoder().to(device)
-
 decoder.load_state_dict(
-    torch.load(decoder_path, map_location=device)
+    torch.load(
+        os.path.join(BASE_DIR, "experiment", "final_exp", "decoder_final.pth"),
+        map_location=device,
+    )
 )
-
 encoder.eval()
 decoder.eval()
+for p in list(encoder.parameters()) + list(decoder.parameters()):
+    p.requires_grad = False
 
+gc.collect()
 logger.info("AdaIN models loaded successfully")
+
+to_tensor = transforms.ToTensor()
+to_pil = transforms.ToPILImage()
 
 
 # -------------------- Form --------------------
@@ -64,16 +82,13 @@ logger.info("AdaIN models loaded successfully")
 class UploadForm(FlaskForm):
     content = FileField("Content Image")
     style = FileField("Style Image")
-
     content_path = HiddenField()
     style_path = HiddenField()
-
     alpha = FloatField(
         "Alpha",
         default=1.0,
-        validators=[InputRequired(), NumberRange(min=0, max=1)]
+        validators=[InputRequired(), NumberRange(min=0, max=1)],
     )
-
     submit = SubmitField("Transfer Style")
 
 
@@ -82,110 +97,108 @@ class UploadForm(FlaskForm):
 def allowed_file(filename):
     return (
         "." in filename
-        and filename.rsplit(".", 1)[1].lower()
-        in app.config["ALLOWED_EXTENSIONS"]
+        and filename.rsplit(".", 1)[1].lower() in app.config["ALLOWED_EXTENSIONS"]
     )
 
 
+def cleanup_old_files():
+    """Remove old files so the disk doesn't fill up."""
+    now = time.time()
+    try:
+        for name in os.listdir(UPLOAD_FOLDER):
+            path = os.path.join(UPLOAD_FOLDER, name)
+            if os.path.isfile(path) and now - os.path.getmtime(path) > FILE_MAX_AGE:
+                os.remove(path)
+    except OSError:
+        logger.exception("Cleanup failed")
+
+
 def save_uploaded_file(file):
+    """Validate, downscale and save an upload. Returns the stored filename."""
     if not file or not file.filename:
         return None
 
     if not allowed_file(file.filename):
         raise ValueError("Only PNG, JPG and JPEG images are allowed.")
 
-    extension = secure_filename(file.filename).rsplit(".", 1)[1].lower()
-    filename = f"{uuid.uuid4().hex}.{extension}"
+    # Opening with PIL also verifies the file really is an image.
+    try:
+        image = Image.open(file.stream).convert("RGB")
+    except Exception:
+        raise ValueError("The uploaded file is not a valid image.")
 
-    file.save(os.path.join(app.config["UPLOAD_FOLDER"], filename))
+    # Downscale right away: smaller file on disk and less RAM later.
+    image.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
 
+    filename = f"{uuid.uuid4().hex}.jpg"
+    image.save(os.path.join(UPLOAD_FOLDER, filename), "JPEG", quality=92)
+    image.close()
     return filename
 
 
 def load_image(filename):
-    safe_filename = secure_filename(filename)
-
-    if not safe_filename:
+    safe_name = secure_filename(filename)
+    if not safe_name:
         raise ValueError("Invalid image filename.")
 
-    image_path = os.path.join(app.config["UPLOAD_FOLDER"], safe_filename)
-
-    if not os.path.isfile(image_path):
+    path = os.path.join(UPLOAD_FOLDER, safe_name)
+    if not os.path.isfile(path):
         raise ValueError("Uploaded image not found. Please upload it again.")
 
-    image = Image.open(image_path).convert("RGB")
-
-    # Limit image dimensions to reduce RAM consumption.
-    image.thumbnail((512, 512))
-
+    image = Image.open(path).convert("RGB")
+    image.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
     return image
 
 
-# -------------------- Style Transfer --------------------
+# -------------------- Style transfer --------------------
 
 def style_transfer(content_image, style_image, alpha):
-    image_transform = transforms.Compose([
-        transforms.Resize(256, max_size=512),
-        transforms.ToTensor()
-    ])
+    content = to_tensor(content_image).unsqueeze(0).to(device)
+    style = to_tensor(style_image).unsqueeze(0).to(device)
 
-    content_tensor = image_transform(content_image).unsqueeze(0).to(device)
-    style_tensor = image_transform(style_image).unsqueeze(0).to(device)
+    with torch.inference_mode():
+        content_feats = encoder(content, is_test=True)
+        style_feats = encoder(style, is_test=True)
+        del content, style
 
-    try:
-        with torch.inference_mode():
-            content_features = encoder(content_tensor, is_test=True)
-            style_features = encoder(style_tensor, is_test=True)
+        stylized = adaptive_instance_normalization(content_feats, style_feats)
+        del style_feats
 
-            stylized_features = adaptive_instance_normalization(
-                content_features,
-                style_features
-            )
+        stylized = alpha * stylized + (1 - alpha) * content_feats
+        del content_feats
 
-            stylized_features = (
-                alpha * stylized_features
-                + (1 - alpha) * content_features
-            )
+        output = decoder(stylized)
+        del stylized
 
-            stylized_image = decoder(stylized_features)
-
-        return stylized_image
-
-    finally:
-        del content_tensor, style_tensor
-
-
-def save_image(image, path):
-    image = image.detach().cpu().squeeze(0).clamp(0, 1)
-    image = transforms.ToPILImage()(image)
-    image.save(path)
+    return output.squeeze(0).clamp(0, 1).cpu()
 
 
 # -------------------- Routes --------------------
 
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     form = UploadForm()
-
     result_image = None
     content_filename = None
     style_filename = None
     error = None
 
     if request.method == "POST":
-
         if form.validate_on_submit():
             try:
-                # Save newly uploaded files or reuse existing selections.
-                content_filename = save_uploaded_file(form.content.data)
+                cleanup_old_files()
 
-                if not content_filename:
-                    content_filename = secure_filename(form.content_path.data or "")
-
-                style_filename = save_uploaded_file(form.style.data)
-
-                if not style_filename:
-                    style_filename = secure_filename(form.style_path.data or "")
+                content_filename = save_uploaded_file(form.content.data) or secure_filename(
+                    form.content_path.data or ""
+                )
+                style_filename = save_uploaded_file(form.style.data) or secure_filename(
+                    form.style_path.data or ""
+                )
 
                 if not content_filename or not style_filename:
                     raise ValueError("Please upload both content and style images.")
@@ -198,32 +211,23 @@ def index():
                 content_image = load_image(content_filename)
                 style_image = load_image(style_filename)
 
-                alpha = form.alpha.data
-
-                output = style_transfer(
-                    content_image,
-                    style_image,
-                    alpha
-                )
+                output = style_transfer(content_image, style_image, float(form.alpha.data))
 
                 result_filename = f"stylized_{uuid.uuid4().hex}.png"
-                result_path = os.path.join(
-                    app.config["UPLOAD_FOLDER"],
-                    result_filename
-                )
-
-                save_image(output, result_path)
-
+                to_pil(output).save(os.path.join(UPLOAD_FOLDER, result_filename))
                 result_image = result_filename
 
                 logger.info("Style transfer completed successfully")
 
                 del output, content_image, style_image
 
-            except Exception as exc:
-                logger.exception("Style transfer failed")
+            except ValueError as exc:
                 error = str(exc)
-
+            except Exception:
+                logger.exception("Style transfer failed")
+                error = "Something went wrong while processing the images. Please try smaller images."
+            finally:
+                gc.collect()
         else:
             error = "Please check your uploaded images and alpha value."
             logger.warning("Form validation failed: %s", form.errors)
@@ -234,27 +238,24 @@ def index():
         result_image=result_image,
         content_image=content_filename or form.content_path.data,
         style_image=style_filename or form.style_path.data,
-        error=error
+        error=error,
     )
 
 
 @app.route("/uploads/<filename>")
 def send_image(filename):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+    return send_from_directory(UPLOAD_FOLDER, filename)
 
 
 @app.route("/examples/<path:filename>")
 def send_example(filename):
-    return send_from_directory(
-        os.path.join(BASE_DIR, "examples"),
-        filename
-    )
+    return send_from_directory(os.path.join(BASE_DIR, "examples"), filename)
 
 
 @app.errorhandler(413)
-def file_too_large(error):
-    return "Image is too large. Maximum upload size is 8 MB.", 413
+def file_too_large(_):
+    return "Image is too large. Maximum upload size is 5 MB.", 413
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
